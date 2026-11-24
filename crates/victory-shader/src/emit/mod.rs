@@ -84,6 +84,8 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod spill_table_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
