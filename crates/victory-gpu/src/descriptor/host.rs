@@ -1094,6 +1094,25 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// The unordered access view a null description makes of a 2D texture
+/// (twins are): mip 0, every array slice; the format is the caller's.
+fn whole_uav(texture: &ID3D12Resource) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    // SAFETY: a live resource.
+    let slices = u32::from(unsafe { texture.GetDesc() }.DepthOrArraySize);
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    };
+    if slices > 1 {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+            ArraySize: slices,
+            ..Default::default()
+        };
+    }
+    desc
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1144,7 +1163,34 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
+            // The plane the title's view names (a depth target's stencil is
+            // plane 1, which has a twin of its own).
+            let plane = desc
+                .as_ref()
+                .map(uav_desc)
+                .filter(|d| {
+                    matches!(
+                        d.ViewDimension,
+                        D3D12_UAV_DIMENSION_TEXTURE2D | D3D12_UAV_DIMENSION_TEXTURE2DARRAY
+                    )
+                })
+                // SAFETY: the union member the view dimension names.
+                .map_or(0, |d| unsafe {
+                    if d.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+                        d.Anonymous.Texture2D.PlaneSlice
+                    } else {
+                        d.Anonymous.Texture2DArray.PlaneSlice
+                    }
+                });
+            let twinned = crate::resource::host_unordered(resource, plane);
+            if twinned.is_none() && plane != 0 && crate::resource::host_copy(resource).is_some() {
+                once!(
+                    plane,
+                    "an unordered access view of a depth target's stencil plane without a twin"
+                );
+                return None;
+            }
+            let Some((texture, twin_format)) = twinned else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
@@ -1153,6 +1199,26 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
+            // A depth target's twin is typeless: views name a format of its
+            // family; a depth one, the typeless one or none becomes the one
+            // with the depth's bits.
+            if let Some(format) = twin_format {
+                use crate::resource::{DEPTH_FORMATS, family};
+                let d = desc.get_or_insert_with(|| whole_uav(texture));
+                let own = d.Format.0 as u32;
+                if own == 0 || own == family(format) || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
+                {
+                    d.Format.0 = format as i32;
+                }
+                // A twin has one plane: the view names plane 0 of it.
+                match d.ViewDimension {
+                    D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice = 0,
+                    D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                        d.Anonymous.Texture2DArray.PlaneSlice = 0;
+                    }
+                    _ => {}
+                }
+            }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }

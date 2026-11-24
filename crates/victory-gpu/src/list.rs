@@ -327,11 +327,15 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
+        // Unordered access to a depth target is to its twin; one with a
+        // stencil twin as well has two, so the barrier covers every
+        // resource.
         2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
+            first: if b.first.is_null() || crate::resource::has_stencil_twin(b.first) {
+                std::ptr::null()
             } else {
-                host(b.first)?
+                let (texture, _) = crate::resource::host_unordered(b.first, 0)?;
+                texture.as_raw().cast_const().cast()
             },
             ..*b
         }),
