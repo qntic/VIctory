@@ -994,7 +994,10 @@ impl HostList {
     }
 
     /// Records a copy of all of `src` into `dst` (a depth target and its
-    /// twin), with the transitions it needs.
+    /// twin), with the transitions it needs. A depth target with a stencil
+    /// plane and its single-plane twin copy the depth plane only, one
+    /// subresource at a time (plane 0's subresources are numbered as the
+    /// twin's); the stencil plane keeps its values.
     fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
@@ -1008,7 +1011,29 @@ impl HostList {
             if !barriers.is_empty() {
                 self.list.ResourceBarrier(&barriers);
             }
-            self.list.CopyResource(&dst.texture, &src.texture);
+            let (d, s) = (dst.texture.GetDesc(), src.texture.GetDesc());
+            if d.Format == s.Format {
+                self.list.CopyResource(&dst.texture, &src.texture);
+            } else {
+                let subresources = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+                for index in 0..subresources {
+                    let at = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: index,
+                        },
+                    };
+                    self.list.CopyTextureRegion(
+                        &at(&dst.texture),
+                        0,
+                        0,
+                        0,
+                        &at(&src.texture),
+                        None,
+                    );
+                }
+            }
         }
     }
 

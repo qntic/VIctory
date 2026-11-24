@@ -687,6 +687,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     d.Format.0 = format as i32;
                 }
+                // The twin holds the depth plane only: a view of another
+                // plane (a stencil) would write depth bits.
+                // SAFETY: the union member the view dimension names.
+                let plane = unsafe {
+                    match d.ViewDimension {
+                        D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice,
+                        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.PlaneSlice,
+                        _ => 0,
+                    }
+                };
+                if plane != 0 {
+                    once!(
+                        plane,
+                        "an unordered access view of a depth target's stencil plane"
+                    );
+                    return None;
+                }
             }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
