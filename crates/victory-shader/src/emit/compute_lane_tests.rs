@@ -135,9 +135,9 @@ fn lanes_cs(body: &[u32], wave64: bool) -> Result<HostShader, String> {
     };
     let e = |e: crate::ShaderError| e.to_string();
     let p = ir::build(&native.code, native.wave64, native.vgprs).map_err(e)?;
-    let res = resource::track(&p, &native.layout, native.stage).map_err(e)?;
-    let io = io::raise(&p, &native).map_err(e)?;
     let st = structure::structure(&p).map_err(e)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).map_err(e)?;
+    let io = io::raise(&p, &native).map_err(e)?;
     let lowered = super::lower::lower(&super::lower::Parts {
         native: &native,
         p: &p,
@@ -158,6 +158,9 @@ fn lanes_cs(body: &[u32], wave64: bool) -> Result<HostShader, String> {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        address_srvs: lowered.address_srvs,
+        stride_table: lowered.stride_table,
     };
     if let Ok(mut v) =
         super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
