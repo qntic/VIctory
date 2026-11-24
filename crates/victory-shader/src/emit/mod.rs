@@ -76,6 +76,8 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod spill_table_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
