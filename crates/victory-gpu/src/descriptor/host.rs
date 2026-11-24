@@ -667,7 +667,34 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some((texture, twin_format)) = crate::resource::host_unordered(resource) else {
+            // The plane the title's view names (a depth target's stencil is
+            // plane 1, which has a twin of its own).
+            let plane = desc
+                .as_ref()
+                .map(uav_desc)
+                .filter(|d| {
+                    matches!(
+                        d.ViewDimension,
+                        D3D12_UAV_DIMENSION_TEXTURE2D | D3D12_UAV_DIMENSION_TEXTURE2DARRAY
+                    )
+                })
+                // SAFETY: the union member the view dimension names.
+                .map_or(0, |d| unsafe {
+                    if d.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+                        d.Anonymous.Texture2D.PlaneSlice
+                    } else {
+                        d.Anonymous.Texture2DArray.PlaneSlice
+                    }
+                });
+            let twinned = crate::resource::host_unordered(resource, plane);
+            if twinned.is_none() && plane != 0 && crate::resource::host_copy(resource).is_some() {
+                once!(
+                    plane,
+                    "an unordered access view of a depth target's stencil plane without a twin"
+                );
+                return None;
+            }
+            let Some((texture, twin_format)) = twinned else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
@@ -687,22 +714,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     d.Format.0 = format as i32;
                 }
-                // The twin holds the depth plane only: a view of another
-                // plane (a stencil) would write depth bits.
-                // SAFETY: the union member the view dimension names.
-                let plane = unsafe {
-                    match d.ViewDimension {
-                        D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice,
-                        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.PlaneSlice,
-                        _ => 0,
+                // A twin has one plane: the view names plane 0 of it.
+                match d.ViewDimension {
+                    D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice = 0,
+                    D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                        d.Anonymous.Texture2DArray.PlaneSlice = 0;
                     }
-                };
-                if plane != 0 {
-                    once!(
-                        plane,
-                        "an unordered access view of a depth target's stencil plane"
-                    );
-                    return None;
+                    _ => {}
                 }
             }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {

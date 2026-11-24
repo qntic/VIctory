@@ -765,6 +765,9 @@ pub(crate) struct HostTexture {
     /// its unordered access views name; lists keep the two coherent
     /// (`HostList::transition`).
     pub(crate) twin: Option<std::sync::Arc<HostTexture>>,
+    /// The twin of a depth target's stencil plane ([`host_stencil_twin`]),
+    /// which unordered access views of plane 1 name.
+    pub(crate) stencil: Option<std::sync::Arc<HostTexture>>,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -790,12 +793,15 @@ pub(crate) fn host_resource<'a>(
     resource(this).host.as_deref().map(|h| &h.texture)
 }
 
-/// The host texture unordered access views of a title texture name: the
-/// twin of a depth target that has one, with the format such a view takes
-/// when the title's names none or a depth format; else the host copy.
+/// The host texture unordered access views of `plane` of a title texture
+/// name: the twin of that plane of a depth target that has one, with the
+/// format such a view takes when the title's names none or a depth format;
+/// else the host copy. `None` for a plane of a depth target that has no
+/// twin for it.
 #[cfg(windows)]
 pub(crate) fn host_unordered<'a>(
     this: This,
+    plane: u32,
 ) -> Option<(
     &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     Option<u32>,
@@ -804,6 +810,10 @@ pub(crate) fn host_unordered<'a>(
         return None;
     }
     let host = resource(this).host.as_deref()?;
+    if plane == 1 {
+        // R8_UINT: the stencil's bits.
+        return host.stencil.as_ref().map(|s| (&s.texture, Some(62)));
+    }
     let Some(twin) = &host.twin else {
         return Some((&host.texture, None));
     };
@@ -915,6 +925,63 @@ const TWIN_FORMATS: [(u32, u32); 2] = [(53, 56), (39, 41)];
 /// stencil plane stays in the depth target.
 #[cfg(windows)]
 const PLANAR_TWINS: [(u32, u32); 1] = [(19, 39)];
+
+/// Depth families with a stencil plane: the plane's twin is R8_TYPELESS.
+#[cfg(windows)]
+const STENCIL_FAMILIES: [u32; 2] = [19, 44];
+
+/// Whether a title texture's host copy has a stencil plane twin (barriers
+/// on it then cover every unordered access resource).
+#[cfg(windows)]
+pub(crate) fn has_stencil_twin(this: This) -> bool {
+    !this.is_null()
+        && resource(this)
+            .host
+            .as_ref()
+            .is_some_and(|h| h.stencil.is_some())
+}
+
+/// A twin for unordered access to the stencil plane of host depth target
+/// `depth`: R8_TYPELESS, its size, mips and slices. Copies between them
+/// move plane 1 (`HostList::copy_texture`).
+#[cfg(windows)]
+fn host_stencil_twin(
+    depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let host = crate::host::host()?;
+    // SAFETY: a live resource.
+    let mut d = unsafe { depth.GetDesc() };
+    if d.SampleDesc.Count > 1
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || !STENCIL_FAMILIES.contains(&family(d.Format.0 as u32))
+    {
+        return None;
+    }
+    d.Format.0 = 60;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut twin: Option<ID3D12Resource> = None;
+    // SAFETY: the host's own description, changed to a legal one; the out
+    // pointer is ours.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &d,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut twin,
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, desc = ?d, "no stencil unordered access twin");
+    }
+    twin
+}
 
 /// The typeless format of the twin of a host depth target in `family`, if
 /// it can have one (see [`TWIN_FORMATS`], [`PLANAR_TWINS`]).
@@ -1062,12 +1129,25 @@ fn hand_out_resource(
                         texture,
                         state: 0.into(),
                         twin: None,
+                        stencil: None,
+                    })
+                });
+            let stencil = (desc.flags & BOTH == BOTH)
+                .then(|| host_stencil_twin(&texture))
+                .flatten()
+                .map(|texture| {
+                    std::sync::Arc::new(HostTexture {
+                        texture,
+                        state: 0.into(),
+                        twin: None,
+                        stencil: None,
                     })
                 });
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
                 twin,
+                stencil,
             })
         }),
     });
@@ -2337,6 +2417,280 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(got, STENCIL, "stencil texel ({x}, {y})");
             }
         }
+    }
+
+    /// A depth target with a stencil plane whose stencil the title writes
+    /// as unordered access, through an R8_UINT view of plane 1 (8x8, title
+    /// format `format`, host depth-stencil view format `dsv_format`): the
+    /// writes reach the stencil plane, in the list and in the next one, the
+    /// stencil keeps its clear value where the shader does not write, and
+    /// the depth plane (read back as `depth_rows`, `depth_bytes` per texel,
+    /// its bits by `depth_of`) keeps the cleared `depth`.
+    #[cfg(windows)]
+    fn stencil_writes_reach_the_stencil_plane(
+        format: u32,
+        dsv_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        depth_rows: u32,
+        depth_bytes: usize,
+        depth_of: fn(&[u8]) -> u32,
+        depth: u32,
+    ) {
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::{Interface, s};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null: This = std::ptr::null();
+        let mut target = null;
+        let desc = ResourceDesc {
+            flags: 2 | 4,
+            ..texture(8, 8, format, 1)
+        };
+        const DEPTH_WRITE: u32 = 0x10;
+        let (iid, clear) = (&RESOURCE_IIDS[0], null.cast());
+        let made = create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &desc,
+            DEPTH_WRITE,
+            clear,
+            iid,
+            &mut target,
+        );
+        assert_eq!(made, S_OK);
+        // The title's view, R8_UINT 2D, plane 1.
+        let heap = crate::descriptor::host::HostHeap::new(false, 1).unwrap();
+        let view = Some([62, 4, 0, 1, 0, 0, 0, 0, 0, 0]);
+        heap.make_at(
+            0,
+            &crate::descriptor::View::Unordered(target as usize, 0, view),
+        );
+        const FILL: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(UAV(u0))"
+cbuffer Fill : register(b0) { uint value; uint columns; };
+RWTexture2D<uint> stencil : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x < columns) stencil[id.xy] = value;
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; out pointer
+        // ours. Then the blob's own bytes, the root signature inside.
+        let (root, pso) = unsafe {
+            let (source, len) = (FILL.as_ptr().cast(), FILL.len());
+            let (name, main, model) = (s!("fill"), s!("main"), s!("cs_5_1"));
+            D3DCompile(
+                source, len, name, None, None, main, model, 0, 0, &mut code, None,
+            )
+            .unwrap();
+            let code = code.unwrap();
+            let (start, size) = (code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = std::slice::from_raw_parts(start, size);
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+        // Writes `value` to the columns before `columns`.
+        let fill = |list: &crate::host::HostList, value: u32, columns: u32| {
+            const UNORDERED_ACCESS: u32 = 0x8;
+            crate::list::ensure_state(list, target, UNORDERED_ACCESS);
+            let constants = [value, columns];
+            // SAFETY: an open list; our heap, root signature and pipeline.
+            unsafe {
+                let l = &list.list;
+                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                l.SetComputeRootDescriptorTable(1, heap.heap.GetGPUDescriptorHandleForHeapStart());
+                l.Dispatch(1, 1, 1);
+            }
+        };
+
+        const STENCIL: u8 = 0x5a;
+        const CLEAR_BOTH: D3D12_CLEAR_FLAGS =
+            D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH.0 | D3D12_CLEAR_FLAG_STENCIL.0);
+        // One list clears depth and stencil, then writes four columns of
+        // stencil as it ends.
+        let first = host.new_list().unwrap();
+        crate::list::ensure_state(&first, target, DEPTH_WRITE);
+        let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: dsv_format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let dsv = host.dsv(host_resource(target).unwrap(), Some(&dsv));
+        // SAFETY: an open list and a fresh view.
+        unsafe {
+            first
+                .list
+                .ClearDepthStencilView(dsv, CLEAR_BOTH, 0.25, STENCIL, None)
+        };
+        fill(&first, 0x11, 4);
+        first.close();
+        // With the debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics): what
+        // the list recorded, the plane copies among it, is legal. (Executing
+        // drains the messages, so they are read before.)
+        assert_eq!(host.log_messages(), None, "debug layer");
+        host.execute(&[&first]);
+
+        // The next writes two columns, then copies both planes out.
+        let second = host.new_list().unwrap();
+        fill(&second, 0x22, 2);
+        crate::list::ensure_state(&second, target, 0x800); // copy source
+        let memory = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let buffer = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 16 * 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut out: Option<ID3D12Resource> = None;
+        let state = D3D12_RESOURCE_STATE_COPY_DEST;
+        let flags = D3D12_HEAP_FLAG_NONE;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            let device = &host.device;
+            device
+                .CreateCommittedResource(&memory, flags, &buffer, state, None, &mut out)
+                .unwrap();
+        }
+        let readback = out.unwrap();
+        #[repr(C)]
+        struct Location(This, u32, PlacedFootprint);
+        let rows = PlacedFootprint {
+            offset: 0,
+            format: depth_rows,
+            width: 8,
+            height: 8,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let texture = host_resource(target).unwrap().as_raw().cast_const().cast();
+        let buffer = readback.as_raw().cast_const().cast();
+        // Plane 0 (subresource 0) at 0; plane 1 (subresource 1), R8_TYPELESS,
+        // after it.
+        let copies = [
+            (
+                Location(buffer, 1, rows),
+                Location(
+                    texture,
+                    0,
+                    PlacedFootprint {
+                        offset: 0,
+                        ..NO_FOOTPRINT
+                    },
+                ),
+            ),
+            (
+                Location(
+                    buffer,
+                    1,
+                    PlacedFootprint {
+                        offset: 8 * 256,
+                        format: 60,
+                        ..rows
+                    },
+                ),
+                Location(
+                    texture,
+                    0,
+                    PlacedFootprint {
+                        offset: 1,
+                        ..NO_FOOTPRINT
+                    },
+                ),
+            ),
+        ];
+        for (to, from) in &copies {
+            // SAFETY: an open list, live resources, locations in the host
+            // layout.
+            unsafe {
+                let (to, from) = ((&raw const *to).cast(), (&raw const *from).cast());
+                second.list.CopyTextureRegion(to, 0, 0, 0, from, None);
+            }
+        }
+        second.close();
+        assert_eq!(host.log_messages(), None, "debug layer");
+        host.execute(&[&second]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); 16 rows of 256 bytes.
+        let read = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 16 * 256)
+        };
+        for y in 0..8 {
+            for x in 0..8 {
+                let wanted = match x {
+                    0..2 => 0x22,
+                    2..4 => 0x11,
+                    _ => STENCIL,
+                };
+                let got = read[8 * 256 + y * 256 + x];
+                assert_eq!(got, wanted, "stencil texel ({x}, {y})");
+                let at = y * 256 + x * depth_bytes;
+                let got = depth_of(&read[at..at + depth_bytes]);
+                assert_eq!(got, depth, "depth texel ({x}, {y})");
+            }
+        }
+    }
+
+    /// [`stencil_writes_reach_the_stencil_plane`] on D24_UNORM_S8_UINT (the
+    /// host's depth for the console's 16-bit depth with stencil); its depth
+    /// plane reads back as R32_TYPELESS, the depth in the low 24 bits.
+    #[cfg(windows)]
+    #[test]
+    fn stencil_writes_reach_a_d24s8_targets_stencil_plane() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT;
+        let depth_of = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0xFF_FFFF;
+        let depth = (0.25 * f64::from(0xFF_FFFF_u32)).round() as u32;
+        stencil_writes_reach_the_stencil_plane(
+            45,
+            DXGI_FORMAT_D24_UNORM_S8_UINT,
+            39,
+            4,
+            depth_of,
+            depth,
+        );
+    }
+
+    /// [`stencil_writes_reach_the_stencil_plane`] on D32_FLOAT_S8X24_UINT.
+    #[cfg(windows)]
+    #[test]
+    fn stencil_writes_reach_a_d32s8_targets_stencil_plane() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        let depth_of = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        stencil_writes_reach_the_stencil_plane(
+            20,
+            DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            39,
+            4,
+            depth_of,
+            0.25f32.to_bits(),
+        );
     }
 
     #[test]

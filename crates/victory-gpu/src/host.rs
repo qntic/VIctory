@@ -294,7 +294,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// Depth targets the list gave unordered access to since it last made
     /// them current: their twins hold their contents until copied back.
-    twins: Mutex<Vec<HostCopy>>,
+    twins: Mutex<Vec<(HostCopy, HostCopy)>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -867,10 +867,8 @@ impl HostList {
     pub(crate) fn close(&self) {
         // Lists end, and so start, with depth targets current, not twins.
         let twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
-        for depth in &twins {
-            if let Some(twin) = &depth.twin {
-                self.copy_texture(depth, twin);
-            }
+        for (depth, twin) in &twins {
+            self.copy_texture(depth, twin);
         }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -925,10 +923,12 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        if let Some(twin) = &copy.twin
-            && self.sync_twin(&copy, twin, wanted)
-        {
-            // Unordered access goes to the twin; the depth stays as it is.
+        let mut unordered = false;
+        for twin in [&copy.twin, &copy.stencil].into_iter().flatten() {
+            unordered |= self.sync_twin(&copy, twin, wanted);
+        }
+        if unordered {
+            // Unordered access goes to the twins; the depth stays as it is.
             return None;
         }
         let wanted = legal_state(texture, wanted);
@@ -972,10 +972,12 @@ impl HostList {
         const UNORDERED_ACCESS: u32 = 0x8;
         let unordered = wanted & UNORDERED_ACCESS != 0;
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-        let ahead = twins.iter().position(|d| std::sync::Arc::ptr_eq(d, depth));
+        let ahead = twins
+            .iter()
+            .position(|(_, t)| std::sync::Arc::ptr_eq(t, twin));
         match (unordered, ahead) {
             (true, None) => {
-                twins.push(depth.clone());
+                twins.push((depth.clone(), twin.clone()));
                 drop(twins);
                 self.copy_texture(twin, depth);
             }
@@ -995,9 +997,10 @@ impl HostList {
 
     /// Records a copy of all of `src` into `dst` (a depth target and its
     /// twin), with the transitions it needs. A depth target with a stencil
-    /// plane and its single-plane twin copy the depth plane only, one
-    /// subresource at a time (plane 0's subresources are numbered as the
-    /// twin's); the stencil plane keeps its values.
+    /// plane and a single-plane twin copy one plane, one subresource at a
+    /// time: the depth plane (plane 0, numbered as the twin's subresources)
+    /// or, for the stencil's R8 twin, plane 1 (after all of plane 0's); the
+    /// other plane keeps its values.
     fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
@@ -1015,9 +1018,27 @@ impl HostList {
             if d.Format == s.Format {
                 self.list.CopyResource(&dst.texture, &src.texture);
             } else {
-                let subresources = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
-                for index in 0..subresources {
-                    let at = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                // The twin is the side in a single-plane format; R8 holds a
+                // stencil.
+                const R8_TYPELESS: i32 = 60;
+                let twin = if dst.twin.is_none() && dst.stencil.is_none() {
+                    &d
+                } else {
+                    &s
+                };
+                let per_plane = u32::from(twin.MipLevels) * u32::from(twin.DepthOrArraySize);
+                let base = if twin.Format.0 == R8_TYPELESS {
+                    per_plane
+                } else {
+                    0
+                };
+                let (dst_base, src_base) = if std::ptr::eq(twin, &d) {
+                    (0, base)
+                } else {
+                    (base, 0)
+                };
+                for index in 0..per_plane {
+                    let at = |texture: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
                         pResource: std::mem::transmute_copy(texture),
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
@@ -1025,11 +1046,11 @@ impl HostList {
                         },
                     };
                     self.list.CopyTextureRegion(
-                        &at(&dst.texture),
+                        &at(&dst.texture, dst_base + index),
                         0,
                         0,
                         0,
-                        &at(&src.texture),
+                        &at(&src.texture, src_base + index),
                         None,
                     );
                 }
