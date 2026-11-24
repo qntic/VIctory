@@ -59,6 +59,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let faults = crate::copystat::Faults::new(crate::copystat::C::FaultsWatch);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -82,6 +84,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
+        drop(faults);
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }

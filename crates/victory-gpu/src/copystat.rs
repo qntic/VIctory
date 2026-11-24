@@ -37,12 +37,35 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Page faults of this process taken in each phase (see [`Faults`]).
+    FaultsMove,
+    FaultsSnapshot,
+    FaultsCopyBack,
+    FaultsWatch,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 26;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Counts the process's page faults from its creation to its drop under
+/// `c`. Process-wide: faults other threads take meanwhile count too, so the
+/// phases are an upper bound, read against the total.
+pub(crate) struct Faults(C, u64);
+
+impl Faults {
+    pub(crate) fn new(c: C) -> Self {
+        Faults(c, page_faults())
+    }
+}
+
+impl Drop for Faults {
+    fn drop(&mut self) {
+        let c = std::mem::replace(&mut self.0, C::Submissions);
+        add(c, page_faults().saturating_sub(self.1));
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -71,7 +94,7 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     e.2 += us;
 }
 
-fn page_faults() -> u64 {
+pub(crate) fn page_faults() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -127,6 +150,14 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    tracing::info!(
+        "page faults per frame by phase: moves {:.0}, snapshots {:.0}, copy-back {:.0},          write watches {:.0} (of {:.0})",
+        c[C::FaultsMove as usize],
+        c[C::FaultsSnapshot as usize],
+        c[C::FaultsCopyBack as usize],
+        c[C::FaultsWatch as usize],
+        faults as f64 / frames,
+    );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
@@ -142,6 +173,39 @@ pub(crate) fn log(frames: f64) {
             n as f64 / frames,
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{C, COUNT, Faults};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// First touches of fresh memory are page faults; touching it again is
+    /// not. (The counter is process-wide, so the bounds leave room for other
+    /// tests' threads.)
+    #[test]
+    fn faults_count_first_touches() {
+        const SIZE: usize = 64 << 20;
+        let read = || COUNT[C::FaultsSnapshot as usize].load(Relaxed);
+        let mut memory: Vec<u8> = Vec::with_capacity(SIZE);
+        let before = read();
+        {
+            let _f = Faults::new(C::FaultsSnapshot);
+            memory.resize(SIZE, 1);
+        }
+        let first = read() - before;
+        assert!(first >= (SIZE / 4096) as u64, "first touch: {first} faults");
+        let before = read();
+        {
+            let _f = Faults::new(C::FaultsSnapshot);
+            memory.fill(2);
+        }
+        let again = read() - before;
+        assert!(
+            again < first / 10,
+            "touched again: {again} faults (first {first})"
         );
     }
 }

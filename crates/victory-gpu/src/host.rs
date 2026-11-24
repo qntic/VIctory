@@ -1312,7 +1312,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let faults = crate::copystat::Faults::new(crate::copystat::C::FaultsMove);
     let whole = read(src, dst, len);
+    #[cfg(feature = "diagnostics")]
+    drop(faults);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {

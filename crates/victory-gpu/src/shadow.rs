@@ -149,6 +149,8 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        #[cfg(feature = "diagnostics")]
+        let _faults = crate::copystat::Faults::new(crate::copystat::C::FaultsSnapshot);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -188,6 +190,8 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _faults = crate::copystat::Faults::new(crate::copystat::C::FaultsCopyBack);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
