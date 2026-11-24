@@ -151,7 +151,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexChanged as usize]),
     );
     tracing::info!(
-        "page faults per frame by phase: moves {:.0}, snapshots {:.0}, copy-back {:.0},          write watches {:.0} (of {:.0})",
+        "page faults per frame by phase: moves {:.0}, snapshots {:.0}, copy-back {:.0}, \
+         write watches {:.0} (of {:.0})",
         c[C::FaultsMove as usize],
         c[C::FaultsSnapshot as usize],
         c[C::FaultsCopyBack as usize],
