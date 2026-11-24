@@ -86,6 +86,11 @@ impl RawWindow {
     }
 }
 
+/// Where root SRVs at addresses passed in two root constants are bound:
+/// `t<n>` in this space, `n` the position in the shader's list of them.
+/// (Space 2 is the runtime stride table's, [`STRIDE_SPACE`].)
+pub const ROOT_ADDRESS_SPACE: u32 = 3;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -144,6 +149,9 @@ pub(crate) struct Shader {
     pub stride_table: Option<V>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root SRVs (raw buffers) at addresses in root constants, by the low
+    /// half's user-data index, with their handles.
+    pub address_srvs: Vec<(u32, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -201,6 +209,7 @@ impl Shader {
             root_srvs: Vec::new(),
             stride_table: None,
             root_uavs: Vec::new(),
+            address_srvs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -367,6 +376,32 @@ impl Shader {
         h
     }
 
+    /// The handle of the root SRV (a raw buffer) at the address whose low
+    /// half is user-data dword `key`: `t<n>` in [`ROOT_ADDRESS_SPACE`], `n`
+    /// its position in `address_srvs`.
+    pub fn address_srv_handle(&mut self, key: u32) -> V {
+        if let Some(&(_, h)) = self.address_srvs.iter().find(|r| r.0 == key) {
+            return h;
+        }
+        let r = self.m.i32(self.address_srvs.len() as u32);
+        let bind = [r, r, self.m.i32(ROOT_ADDRESS_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.address_srvs.push((key, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -451,6 +486,7 @@ impl Shader {
             || !self.root_srvs.is_empty()
             || self.stride_table.is_some()
             || !self.root_uavs.is_empty()
+            || !self.address_srvs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -505,7 +541,12 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || self.stride_table.is_some() {
+            if !self.root_srvs.is_empty()
+                || self.stride_table.is_some()
+                || !self.address_srvs.is_empty()
+            {
+                // Root SRVs by root parameter, the stride table, then those at
+                // addresses in root constants by position.
                 let mut specs: Vec<(u32, u32)> = self
                     .root_srvs
                     .iter()
@@ -514,6 +555,7 @@ impl Shader {
                 if self.stride_table.is_some() {
                     specs.push((STRIDE_SPACE, 0));
                 }
+                specs.extend((0..self.address_srvs.len() as u32).map(|n| (ROOT_ADDRESS_SPACE, n)));
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);

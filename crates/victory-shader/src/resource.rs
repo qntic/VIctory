@@ -11,6 +11,11 @@
 //! descriptor's address itself. Each descriptor operand and each scalar
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
+//!
+//! A title can also pass a 64-bit address as two root constants, low half
+//! first, in consecutive user SGPRs (within one parameter or across two).
+//! Such a pair is recognised from its high half, which the code uses only
+//! as the high half of an address (or adds a carry to): [`Pair`].
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -27,10 +32,21 @@ pub type Site = (usize, usize);
 pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
+    /// The dword of the base within `param`: 0 except for an address in
+    /// root constants ([`Pair`]), where it is the low half's.
+    pub dword: u32,
     /// Added modulo 2^32 (with carry into the high half of a root
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+}
+
+/// A 64-bit address in two root-constant dwords: layout index and dword
+/// of its low half and of its high half (the next user SGPR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pair {
+    pub lo: (usize, u32),
+    pub hi: (usize, u32),
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -117,6 +133,8 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// The root-constant pairs the addresses above start from, once each.
+    pub pairs: Vec<Pair>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -267,6 +285,18 @@ pub fn track(
             out.waterfall.loads.extend(loads);
         }
     }
+    let built = out.descriptors.iter().flat_map(|d| {
+        d.source.leaves().into_iter().filter_map(|l| match l {
+            Source::Built { address, .. } => Some(*address),
+            _ => None,
+        })
+    });
+    let addresses: Vec<Address> = out.scalar.iter().map(|s| s.1).chain(built).collect();
+    for pair in addresses.into_iter().filter_map(|a| t.pair(a)) {
+        if !out.pairs.contains(&pair) {
+            out.pairs.push(pair);
+        }
+    }
     Ok(out)
 }
 
@@ -277,8 +307,8 @@ enum Term {
     Value(Value),
 }
 
-/// A 32-bit sum: optional root parameter (as its first dword), constant,
-/// optional computed term.
+/// A 32-bit sum: optional root parameter (as its first dword, or the low
+/// half of a [`Pair`]), constant, optional computed term.
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -471,7 +501,9 @@ impl<'a> Tracer<'a> {
         ))
     }
 
-    fn sum(&self, t: Term) -> Sum {
+    /// The sum `t` computes; `pair`, the low half of a root-constant pair,
+    /// counts as a base too.
+    fn sum(&self, t: Term, pair: Option<Value>) -> Sum {
         let v = match t {
             Term::Const(c) => {
                 return Sum {
@@ -489,6 +521,11 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
+                _ if pair == Some(v) => Sum {
+                    base: Some(v),
+                    offset: 0,
+                    dynamic: None,
+                },
                 Some((_, 0)) => Sum {
                     base: Some(v),
                     offset: 0,
@@ -511,7 +548,7 @@ impl<'a> Tracer<'a> {
         else {
             return dynamic;
         };
-        let (x, y) = (self.sum(a), self.sum(b));
+        let (x, y) = (self.sum(a, pair), self.sum(b, pair));
         if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
             return dynamic;
         }
@@ -599,7 +636,7 @@ impl<'a> Tracer<'a> {
                     return Err("an address not in SGPRs");
                 };
                 let v = inst.read(Reg::V(reg)).ok_or("a global address")?;
-                let mut extra = self.sum(self.vorigin(v));
+                let mut extra = self.sum(self.vorigin(v), None);
                 if extra.base.is_some() {
                     return Err("an offset from a root parameter");
                 }
@@ -627,7 +664,10 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
-        let s = self.sum(lo);
+        if let Some(a) = self.pair_address(lo, hi, &extra) {
+            return a;
+        }
+        let s = self.sum(lo, None);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
@@ -640,6 +680,7 @@ impl<'a> Tracer<'a> {
             }
             return Ok(Address {
                 param: CODE,
+                dword: 0,
                 offset: (pc.machine.offset as u32 + 4)
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
@@ -669,8 +710,88 @@ impl<'a> Tracer<'a> {
         }
         Ok(Address {
             param,
+            dword: 0,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+        })
+    }
+
+    /// The address a root-constant pair holds: `hi` is the pair's high half
+    /// (possibly plus a carry) and the sum of `lo` starts from its low half.
+    /// `None` when `lo` and `hi` are no pair; the other kinds of address
+    /// never have a root constant as their high half.
+    fn pair_address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: &Sum,
+    ) -> Option<Result<Address, &'static str>> {
+        let (low, high) = self.pair_high(hi)?;
+        let s = self.sum(lo, Some(low));
+        if s.base != Some(low) {
+            return None;
+        }
+        let (param, dword) = self.param_of(self.inputs[low.0 as usize]?)?;
+        if s.dynamic.is_some() && extra.dynamic.is_some() {
+            return Some(Err("an address with two computed terms"));
+        }
+        let dynamic = s.dynamic.or(extra.dynamic);
+        if !self.high_half(hi, Some(high)) && !(dynamic.is_some() && self.carried(hi, high)) {
+            return Some(Err("an address with an untracked high half"));
+        }
+        Some(Ok(Address {
+            param,
+            dword,
+            offset: s.offset.wrapping_add(extra.offset),
+            dynamic,
+        }))
+    }
+
+    /// The root-constant input `hi` is, or adds a carry to (`s_addc_u32`,
+    /// `v_add_co_ci_u32`, as [`Tracer::carried`] walks), when the user SGPR
+    /// below it holds a root constant too: (low half, high half) on entry.
+    fn pair_high(&self, hi: Term) -> Option<(Value, Value)> {
+        let Term::Value(v) = hi else { return None };
+        if let Some(Reg::S(code)) = self.inputs[v.0 as usize] {
+            let below = code.checked_sub(1)?;
+            if !self.is_constant(code) || !self.is_constant(below) {
+                return None;
+            }
+            let low = self.p.inputs.iter().find(|i| i.0 == Reg::S(below))?.1;
+            return Some((low, v));
+        }
+        if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
+            return self.pair_high(a).or_else(|| self.pair_high(b));
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_add_co_ci_u32" {
+            return None;
+        }
+        f.src[..2.min(f.src.len())]
+            .iter()
+            .find_map(|o| self.pair_high(self.vterm(inst, o)?))
+    }
+
+    /// User SGPR `code` holds a root-constant dword.
+    fn is_constant(&self, code: u8) -> bool {
+        self.param_of(Reg::S(code))
+            .is_some_and(|(i, _)| self.layout[i].root == RootType::Constants)
+    }
+
+    /// The pair an address in root constants starts from.
+    fn pair(&self, a: Address) -> Option<Pair> {
+        let rp = self.layout.get(a.param)?;
+        if rp.root != RootType::Constants {
+            return None;
+        }
+        let low = u32::from(self.stage.user_sgpr(rp.user_data)) + a.dword;
+        let high = u8::try_from(low + 1).ok()?;
+        Some(Pair {
+            lo: (a.param, a.dword),
+            hi: self.param_of(Reg::S(high))?,
         })
     }
 
@@ -753,6 +874,7 @@ impl<'a> Tracer<'a> {
         let mut extra = self.sum(
             self.term(inst, soffset)
                 .ok_or("an unknown offset operand")?,
+            None,
         );
         if extra.base.is_some() {
             return Err("an offset from a root parameter");
@@ -1759,6 +1881,7 @@ pub(crate) mod tests {
     fn at(param: usize, offset: u32) -> Address {
         Address {
             param,
+            dword: 0,
             offset,
             dynamic: None,
         }
@@ -3049,5 +3172,114 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// `global_load_dword v1, v0, s[base:base+1]`.
+    fn global_load(base: u8) -> [u32; 2] {
+        [0xDC30_8000, 0x0100_0000 | u32::from(base) << 16]
+    }
+
+    /// The pair and the address of the one global load in `words`.
+    fn pair_load(words: &[u32], layout: &[RootParam]) -> (Vec<Pair>, Address) {
+        let r = track_words(words, layout, HwStage::Cs);
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        (r.pairs, a)
+    }
+
+    #[test]
+    fn root_constant_pairs_are_addresses() {
+        let [l0, l1] = global_load(0);
+        let (pairs, a) = pair_load(&[l0, l1, S_ENDPGM], &[param(Constants, 0, 2)]);
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 0),
+                hi: (0, 1)
+            }]
+        );
+        assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
+        assert!(a.dynamic.is_some(), "the VGPR offset is the computed term");
+    }
+
+    #[test]
+    fn a_root_constant_pair_at_a_later_dword() {
+        let [l0, l1] = global_load(2);
+        let (pairs, a) = pair_load(&[l0, l1, S_ENDPGM], &[param(Constants, 0, 4)]);
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 2),
+                hi: (0, 3)
+            }]
+        );
+        assert_eq!((a.param, a.dword), (0, 2));
+    }
+
+    #[test]
+    fn a_root_constant_pair_across_two_parameters() {
+        let [l0, l1] = global_load(2);
+        let (pairs, a) = pair_load(
+            &[l0, l1, S_ENDPGM],
+            &[param(Constants, 0, 3), param(Constants, 3, 1)],
+        );
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 2),
+                hi: (1, 0)
+            }]
+        );
+        assert_eq!((a.param, a.dword), (0, 2));
+    }
+
+    #[test]
+    fn a_root_constant_pair_plus_an_offset_with_its_carry() {
+        let (pairs, a) = pair_load(
+            &[
+                0xD70F_6A02,
+                0x0002_0000, // v_add_co_u32 v2, vcc_lo, s0, v0
+                0xD528_6A03,
+                0x01A9_0001, // v_add_co_ci_u32 v3, vcc_lo, s1, 0, vcc_lo
+                0xDC30_8000,
+                0x017D_0002, // global_load_dword v1, v[2:3], off
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2)],
+        );
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 0),
+                hi: (0, 1)
+            }]
+        );
+        assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
+        assert!(a.dynamic.is_some());
+    }
+
+    #[test]
+    fn a_root_constant_without_its_high_half_is_no_address() {
+        let [l0, l1] = global_load(0);
+        for hi in [
+            0xBE81_0303, // s_mov_b32 s1, s3: the high half of another pair
+            0xBE81_0380, // s_mov_b32 s1, 0: a 32-bit address
+        ] {
+            let code: Vec<u8> = [hi, l0, l1, S_ENDPGM]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let err = track(&p, &[param(Constants, 0, 4)], HwStage::Cs, None).unwrap_err();
+            assert_eq!(
+                err,
+                ShaderError::Unsupported {
+                    offset: 4,
+                    what: "an address from a root parameter that is no address"
+                },
+                "{hi:#x}"
+            );
+        }
     }
 }

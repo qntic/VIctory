@@ -2,13 +2,16 @@
 //! title's graphics state with the translated shaders, under a root
 //! signature of our own that the translated shaders' bindings define
 //! (`victory_shader::emit`): per stage one block of root constants for the
-//! user data, root views for the title's root views, static samplers for
-//! the immediate samplers, and directly indexed heaps.
+//! user data, root views for the title's root views and for addresses the
+//! title passes in root constants, static samplers for the immediate
+//! samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    AddressView, ROOT_ADDRESS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -259,6 +262,10 @@ pub(crate) struct Stage {
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Root parameters of its root SRVs at addresses in root constants:
+    /// (the two constants, ours), `t<n>` in [`ROOT_ADDRESS_SPACE`] for the
+    /// one at position n.
+    pub(crate) address_srvs: Vec<(AddressView, u32)>,
 }
 
 impl Stage {
@@ -357,6 +364,7 @@ impl HostPipeline {
                 root_srvs: Vec::new(),
                 stride_table: None,
                 root_uavs: Vec::new(),
+                address_srvs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -406,6 +414,20 @@ impl HostPipeline {
                         Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                             ShaderRegister: 0,
                             RegisterSpace: STRIDE_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
+            for (n, &view) in t.address_srvs.iter().enumerate() {
+                stage.address_srvs.push((view, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: n as u32,
+                            RegisterSpace: ROOT_ADDRESS_SPACE,
                             Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                         },
                     },

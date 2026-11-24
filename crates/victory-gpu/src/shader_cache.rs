@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{AddressView, HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -175,11 +175,14 @@ fn encode(s: &HostShader) -> Vec<u8> {
     word(&mut out, stage);
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
+    let user = |out: &mut Vec<u8>, u: &UserData| {
+        for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
+            word(out, v);
+        }
+    };
     word(&mut out, s.user_data.len() as u32);
     for u in &s.user_data {
-        for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
-            word(&mut out, v);
-        }
+        user(&mut out, u);
     }
     word(&mut out, s.samplers.len() as u32);
     for sampler in &s.samplers {
@@ -211,6 +214,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.stride_table));
+    word(&mut out, s.address_srvs.len() as u32);
+    for view in &s.address_srvs {
+        user(&mut out, &view.lo);
+        user(&mut out, &view.hi);
+    }
     out
 }
 
@@ -229,6 +237,14 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             let n = self.word()? as usize;
             Some(self.take(n)?.to_vec())
         }
+        fn user(&mut self) -> Option<UserData> {
+            Some(UserData {
+                index: self.word()?,
+                slot: u8::try_from(self.word()?).ok()?,
+                root: root_type(self.word()?),
+                dword: self.word()?,
+            })
+        }
     }
     let mut r = Reader(bytes);
     if r.take(4)? != MAGIC {
@@ -239,12 +255,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
     for _ in 0..n {
-        user_data.push(UserData {
-            index: r.word()?,
-            slot: u8::try_from(r.word()?).ok()?,
-            root: root_type(r.word()?),
-            dword: r.word()?,
-        });
+        user_data.push(r.user()?);
     }
     let n = r.word()? as usize;
     let mut samplers = Vec::with_capacity(n.min(256));
@@ -269,6 +280,14 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
+    let n = r.word()? as usize;
+    let mut address_srvs = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        address_srvs.push(AddressView {
+            lo: r.user()?,
+            hi: r.user()?,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -279,6 +298,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         stride_table,
         root_uavs,
+        address_srvs,
     })
 }
 
@@ -307,6 +327,20 @@ mod tests {
             root_srvs: vec![0, 3],
             stride_table: true,
             root_uavs: vec![1],
+            address_srvs: vec![AddressView {
+                lo: UserData {
+                    index: 3,
+                    slot: 0,
+                    root: RootType::Constants,
+                    dword: 3,
+                },
+                hi: UserData {
+                    index: 4,
+                    slot: 4,
+                    root: RootType::Constants,
+                    dword: 0,
+                },
+            }],
         }
     }
 
@@ -331,7 +365,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);

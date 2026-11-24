@@ -113,7 +113,8 @@ impl Host {
     }
 
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow.
+    /// parameter k, root views follow, then the root SRVs at addresses in
+    /// root constants.
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -172,6 +173,23 @@ impl Host {
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
+        }
+        // Root SRVs at addresses in root constants follow, per stage in
+        // order (each stage numbers its own from 0).
+        for &(s, vis) in stages {
+            for n in 0..s.address_srvs.len() as u32 {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: n,
+                            RegisterSpace: super::ROOT_ADDRESS_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: vis,
+                });
+            }
         }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
@@ -545,6 +563,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         stride_table: false,
         root_uavs: Vec::new(),
+        address_srvs: Vec::new(),
     }
 }
 

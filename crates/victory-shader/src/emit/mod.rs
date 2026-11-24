@@ -29,6 +29,15 @@
 //!   `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the title's root
 //!   parameter index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`],
 //!   [`HostShader::root_uavs`]); the address the title sets is the buffer's.
+//! * **Addresses in root constants** (added 2026-11-24): a 64-bit address
+//!   the title passes as two root-constant dwords (low half first, in
+//!   consecutive user SGPRs) and the shader only reads through
+//!   (`global_load_*`, `s_buffer_load_*` on a descriptor built around it) is
+//!   a root SRV (raw buffer) `t<n>` in [`ROOT_ADDRESS_SPACE`], `n` the
+//!   position in [`HostShader::address_srvs`]. The host composes the
+//!   address from the two constants' current values at every draw and binds
+//!   the buffer there. Writes, typed views and scalar loads through such an
+//!   address stop the translation.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -98,7 +107,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
+    ROOT_ADDRESS_SPACE, ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
 };
 
 /// The loop limit without an override: 2^20.
@@ -164,6 +173,17 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Root SRVs (raw buffers) at addresses in root constants: `t<n>` in
+    /// [`ROOT_ADDRESS_SPACE`] for the view at position n.
+    pub address_srvs: Vec<AddressView>,
+}
+
+/// A root SRV at the 64-bit address two root-constant dwords hold (both
+/// with `root` [`RootType::Constants`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressView {
+    pub lo: UserData,
+    pub hi: UserData,
 }
 
 impl HostShader {
@@ -326,6 +346,7 @@ pub fn emit(
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
         root_uavs: l.root_uavs,
+        address_srvs: l.address_srvs,
     })
 }
 
@@ -585,6 +606,7 @@ mod tests {
             root_srvs: Vec::new(),
             stride_table: false,
             root_uavs: Vec::new(),
+            address_srvs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -597,6 +619,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 stride_table: false,
                 root_uavs: Vec::new(),
+                address_srvs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -860,6 +883,7 @@ mod tests {
             root_srvs: l.root_srvs,
             stride_table: l.stride_table,
             root_uavs: Vec::new(),
+            address_srvs: Vec::new(),
         }
     }
 
