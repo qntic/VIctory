@@ -108,6 +108,8 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                dump(self, done.is_ok());
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -126,6 +128,32 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+/// With `VICTORY_SHADER_DUMP` set (diagnostics builds): the console
+/// container of each shader goes to that folder once, as
+/// `<stage>-<hash>-<ok|refused>.bin`, so the translation can be tried again
+/// offline. Title data: the folder stays local.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump(shader: &Shader, ok: bool) {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_SHADER_DUMP")?);
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir),
+            Err(e) => {
+                tracing::warn!(error = %e, "VICTORY_SHADER_DUMP: no folder; nothing dumped");
+                None
+            }
+        }
+    }) else {
+        return;
+    };
+    let what = if ok { "ok" } else { "refused" };
+    let path = dir.join(format!("{}-{}-{what}.bin", shader.stage, shader.hash));
+    if let Err(e) = std::fs::write(&path, &shader.container) {
+        tracing::warn!(error = %e, path = %path.display(), "shader not dumped");
     }
 }
 
