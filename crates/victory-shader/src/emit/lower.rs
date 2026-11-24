@@ -6579,6 +6579,7 @@ impl<'a> Lower<'a> {
         let last = wave_max(self, rank);
         let mine = self.s.m.cmp(c, pred::EQ, rank, last);
         self.s.flags |= flags::WAVE_OPS;
+        self.console_wave();
         let zero = self.s.m.i32(0);
         for i in joins {
             let v = p.blocks[b].phis[i].value;
@@ -6596,6 +6597,19 @@ impl<'a> Lower<'a> {
                 Val::Missing(_) => continue,
             };
             self.vals.insert(v, f);
+        }
+    }
+
+    /// Wave operations that stand for the console wave's value (the last
+    /// path's, the last iteration's) need host waves of the console's
+    /// size: without a declared size a host may run the program in waves
+    /// of 32 (an RX 6600 XT runs a wave64 program so), and a wave maximum
+    /// then covers half a console wave. Which lanes share a wave is what
+    /// counts here, not their order, so the thread ids keep their host
+    /// numbering.
+    fn console_wave(&mut self) {
+        if self.s.wave_size.is_none() {
+            self.s.wave_size = Some(if self.x.native.wave64 { 64 } else { 32 });
         }
     }
 
@@ -6629,6 +6643,7 @@ impl<'a> Lower<'a> {
             let last = wave_max(self, count);
             let mine = self.s.m.cmp(c, pred::EQ, count, last);
             self.s.flags |= flags::WAVE_OPS;
+            self.console_wave();
             let zero = self.s.m.i32(0);
             let final_of = |l: &mut Self, val: Val| -> Option<Val> {
                 Some(match val {
