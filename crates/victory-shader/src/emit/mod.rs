@@ -76,6 +76,8 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod compute_lane_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
