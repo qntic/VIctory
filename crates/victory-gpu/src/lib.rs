@@ -32,6 +32,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(all(test, windows))]
+mod memory_bench;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
