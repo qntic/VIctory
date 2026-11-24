@@ -443,6 +443,27 @@ fn run(
         return Ok(());
     };
     let ps = pixel_program(words).map_err(|e| format!("{name}: not translated: {e}"))?;
+    // The wave size the driver chose for this translated program (it may
+    // differ from the layout probe's): the same program with its colour's
+    // w replaced by WaveGetLaneCount.
+    super::lower::LANE_COUNT_IN_W.with(|c| c.set(true));
+    let sized = pixel_program(words);
+    super::lower::LANE_COUNT_IN_W.with(|c| c.set(false));
+    let sized = sized.map_err(|e| format!("{name}: not translated with the lane count: {e}"))?;
+    let mut counts = std::collections::BTreeMap::new();
+    for vertices in [&FULL, &PARTIAL] {
+        for t in draw(&host, &sized, vertices).iter().filter(|t| t[0] != 0.0) {
+            *counts.entry(t[3] as u32).or_insert(0u32) += 1;
+        }
+    }
+    eprintln!("{name}: translated program's host wave sizes (lanes: pixels) {counts:?}");
+    if counts.keys().any(|&n| n != 64) {
+        eprintln!(
+            "{name}: NOT EXERCISED: the driver ran the translated program in waves of              {:?} lanes, so no host wave held two console waves; skipped",
+            counts.keys().collect::<Vec<_>>()
+        );
+        return Ok(());
+    }
     let mut wrong = Vec::new();
     for (shape, vertices) in [("full", &FULL), ("partial", &PARTIAL)] {
         let Some(waves) = console_waves(&host, vertices) else {

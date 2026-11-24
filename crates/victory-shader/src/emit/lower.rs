@@ -220,6 +220,14 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// Test aid: channel w of a pixel program's colour exports carries the
+    /// host wave's lane count (`WaveGetLaneCount`) instead of its value, to
+    /// tell the wave size a driver chose for a translated program.
+    pub(super) static LANE_COUNT_IN_W: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -6389,6 +6397,15 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            #[cfg(test)]
+            let (suffix, x) = if self.s.pixel && col == 3 && LANE_COUNT_IN_W.with(|c| c.get()) {
+                let (c, i32t, f32t) = (self.cur, self.s.t.i32, self.s.t.f32);
+                let n = self.s.op(c, "waveGetLaneCount", Attr::ReadNone, i32t, 112, &[]);
+                self.s.flags |= flags::WAVE_OPS;
+                (".f32", self.s.m.cast(c, Cast::UiToFp, n, f32t))
+            } else {
+                (suffix, x)
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),
